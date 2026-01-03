@@ -290,7 +290,7 @@ def send_email(subject: str, body: str):
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER", "")
     smtp_password = os.environ.get("SMTP_PASSWORD", "")
-    recipient = os.environ.get("EMAIL_RECIPIENT", smtp_user)
+    recipient = os.environ.get("EMAIL_RECIPIENT", "") or smtp_user  # 如果 EMAIL_RECIPIENT 为空，使用 SMTP_USER
 
     if not all([smtp_user, smtp_password]):
         print("Email credentials not configured. Printing to console instead:")
