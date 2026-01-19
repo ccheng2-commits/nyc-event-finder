@@ -11,15 +11,161 @@ NYC Event Finder
 import os
 import re
 import json
+import subprocess
 import requests
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 from bs4 import BeautifulSoup
+from dateutil import parser as dateparser
+from dateutil.rrule import rrulestr
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
 
 # 搜索配置
 LOCATION = "New York"
 SEARCH_KEYWORDS = ["tech", "startup", "design", "networking", "AI", "creative"]
 DAYS_AHEAD = 14
+
+# 日历冲突检测配置
+CALENDAR_NAMES = ["ccheng2@sva.edu", "ixD Events", "ixD- class of 2027"]
+ENABLE_CALENDAR_FILTER = True
+
+
+def get_calendar_events() -> List[Tuple[datetime, datetime, str]]:
+    """从 macOS Calendar 获取课程事件（包括重复事件）"""
+    events = []
+
+    calendar_list = '", "'.join(CALENDAR_NAMES)
+    # 简化版本：只获取最近30天内开始的事件
+    script = f'''
+    tell application "Calendar"
+        set output to ""
+        set targetCalendars to {{"{calendar_list}"}}
+        set cutoffDate to (current date) - 30 * days
+
+        repeat with calName in targetCalendars
+            try
+                set cal to calendar calName
+                set evts to (every event of cal whose start date > cutoffDate)
+                repeat with evt in evts
+                    set evtName to summary of evt
+                    set evtStart to start date of evt
+                    set evtEnd to end date of evt
+                    set allDay to allday event of evt
+                    try
+                        set recur to recurrence of evt
+                    on error
+                        set recur to "none"
+                    end try
+                    if allDay is false then
+                        set output to output & evtName & "|" & (evtStart as string) & "|" & (evtEnd as string) & "|" & recur & linefeed
+                    end if
+                end repeat
+            end try
+        end repeat
+        return output
+    end tell
+    '''
+
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', script],
+            capture_output=True, text=True, timeout=60
+        )
+
+        if result.returncode != 0:
+            print(f"  Calendar access error: {result.stderr}")
+            return events
+
+        now = datetime.now()
+        end_date = now + timedelta(days=DAYS_AHEAD)
+
+        for line in result.stdout.strip().split('\n'):
+            if not line or '|' not in line:
+                continue
+
+            parts = line.split('|')
+            if len(parts) < 4:
+                continue
+
+            name, start_str, end_str, rrule = parts[0], parts[1], parts[2], parts[3]
+
+            try:
+                # 解析日期时间
+                start_dt = dateparser.parse(start_str)
+                end_dt = dateparser.parse(end_str)
+                duration = end_dt - start_dt
+
+                if rrule and rrule != "none" and rrule != "missing value":
+                    # 处理重复事件
+                    try:
+                        rule = rrulestr(rrule, dtstart=start_dt)
+                        occurrences = list(rule.between(now, end_date, inc=True))
+                        for occ in occurrences:
+                            events.append((occ, occ + duration, name))
+                    except Exception:
+                        # 如果 RRULE 解析失败，检查原始事件是否在范围内
+                        if now <= start_dt <= end_date:
+                            events.append((start_dt, end_dt, name))
+                else:
+                    # 单次事件
+                    if now <= start_dt <= end_date:
+                        events.append((start_dt, end_dt, name))
+
+            except Exception as e:
+                continue
+
+    except subprocess.TimeoutExpired:
+        print("  Calendar access timed out")
+    except Exception as e:
+        print(f"  Calendar access failed: {e}")
+
+    return events
+
+
+def check_time_conflict(event_time_str: str, calendar_events: List[Tuple[datetime, datetime, str]]) -> Optional[str]:
+    """检查活动时间是否与日历事件冲突，返回冲突的课程名"""
+    if not event_time_str or not calendar_events:
+        return None
+
+    try:
+        # 尝试解析活动时间
+        event_dt = dateparser.parse(event_time_str)
+        if not event_dt:
+            return None
+
+        # 假设活动持续 2 小时
+        event_end = event_dt + timedelta(hours=2)
+
+        for cal_start, cal_end, cal_name in calendar_events:
+            # 检查时间重叠
+            if not (event_end <= cal_start or event_dt >= cal_end):
+                return cal_name
+
+    except Exception:
+        pass
+
+    return None
+
+
+def filter_conflicting_events(events: List[Dict[str, Any]], calendar_events: List[Tuple[datetime, datetime, str]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """过滤与日历冲突的活动，返回 (可参加的活动, 冲突的活动)"""
+    available = []
+    conflicting = []
+
+    for event in events:
+        start_time = event.get("start", "")
+        conflict = check_time_conflict(start_time, calendar_events)
+
+        if conflict:
+            event["conflict_with"] = conflict
+            conflicting.append(event)
+        else:
+            available.append(event)
+
+    return available, conflicting
 
 
 def get_luma_events() -> List[Dict[str, Any]]:
@@ -246,9 +392,11 @@ def collect_all_events() -> List[Dict[str, Any]]:
     return all_events
 
 
-def generate_email_body(events: List[Dict[str, Any]]) -> str:
+def generate_email_body(events: List[Dict[str, Any]], conflicting: List[Dict[str, Any]] = None) -> str:
     """生成邮件内容"""
-    if not events:
+    conflicting = conflicting or []
+
+    if not events and not conflicting:
         return "本周没有找到符合条件的活动。"
 
     # 按来源分组
@@ -263,7 +411,9 @@ def generate_email_body(events: List[Dict[str, Any]]) -> str:
 🗽 NYC Event Finder - 本周活动推荐
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-找到 {len(events)} 个活动（未来 {DAYS_AHEAD} 天）
+✅ 可参加: {len(events)} 个活动
+❌ 与课程冲突: {len(conflicting)} 个活动
+（未来 {DAYS_AHEAD} 天）
 
 搜索关键词：{', '.join(SEARCH_KEYWORDS)}
 """
@@ -272,6 +422,14 @@ def generate_email_body(events: List[Dict[str, Any]]) -> str:
         body += f"\n\n━━━ {source} ({len(source_events)} 个活动) ━━━"
         for event in source_events:
             body += format_event(event)
+
+    # 显示冲突的活动（可选参考）
+    if conflicting:
+        body += "\n\n━━━ ⚠️ 与课程时间冲突的活动 ━━━"
+        for event in conflicting[:5]:  # 最多显示 5 个
+            conflict_name = event.get("conflict_with", "课程")
+            body += f"\n❌ {event.get('name', '')} - 与 [{conflict_name}] 冲突"
+            body += f"\n   🔗 {event.get('url', '')}"
 
     body += """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -327,7 +485,21 @@ def main():
     events = collect_all_events()
     print(f"\nFound {len(events)} unique events total")
 
-    email_body = generate_email_body(events)
+    # 日历冲突检测
+    available_events = events
+    conflicting_events = []
+
+    if ENABLE_CALENDAR_FILTER:
+        print("\n📅 Checking calendar conflicts...")
+        calendar_events = get_calendar_events()
+        print(f"  Found {len(calendar_events)} calendar events in next {DAYS_AHEAD} days")
+
+        if calendar_events:
+            available_events, conflicting_events = filter_conflicting_events(events, calendar_events)
+            print(f"  ✓ {len(available_events)} events available")
+            print(f"  ✗ {len(conflicting_events)} events conflict with your schedule")
+
+    email_body = generate_email_body(available_events, conflicting_events)
     subject = f"🗽 NYC Events - {datetime.now().strftime('%Y-%m-%d')}"
 
     send_email(subject, email_body)
