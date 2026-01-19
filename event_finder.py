@@ -101,7 +101,9 @@ def get_calendar_events() -> List[Tuple[datetime, datetime, str]]:
                 if rrule and rrule != "none" and rrule != "missing value":
                     # 处理重复事件
                     try:
-                        rule = rrulestr(rrule, dtstart=start_dt)
+                        # 移除 UNTIL 中的 Z 后缀（避免时区不匹配错误）
+                        rrule_fixed = re.sub(r'UNTIL=(\d{8}T\d{6})Z', r'UNTIL=\1', rrule)
+                        rule = rrulestr(rrule_fixed, dtstart=start_dt)
                         occurrences = list(rule.between(now, end_date, inc=True))
                         for occ in occurrences:
                             events.append((occ, occ + duration, name))
@@ -122,7 +124,16 @@ def get_calendar_events() -> List[Tuple[datetime, datetime, str]]:
     except Exception as e:
         print(f"  Calendar access failed: {e}")
 
-    return events
+    # 去重（相同时间+名称的事件只保留一个）
+    seen = set()
+    unique_events = []
+    for start, end, name in events:
+        key = (start, name)
+        if key not in seen:
+            seen.add(key)
+            unique_events.append((start, end, name))
+
+    return unique_events
 
 
 def check_time_conflict(event_time_str: str, calendar_events: List[Tuple[datetime, datetime, str]]) -> Optional[str]:
