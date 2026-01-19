@@ -142,10 +142,16 @@ def check_time_conflict(event_time_str: str, calendar_events: List[Tuple[datetim
         return None
 
     try:
+        # 清理 Meetup 时间格式中的特殊字符
+        clean_time = event_time_str.replace(' · ', ' ').replace('·', ' ')
         # 尝试解析活动时间
-        event_dt = dateparser.parse(event_time_str)
+        event_dt = dateparser.parse(clean_time)
         if not event_dt:
             return None
+
+        # 移除时区信息以便与本地时间比较
+        if event_dt.tzinfo is not None:
+            event_dt = event_dt.replace(tzinfo=None)
 
         # 假设活动持续 2 小时
         event_end = event_dt + timedelta(hours=2)
@@ -329,6 +335,12 @@ def get_meetup_events() -> List[Dict[str, Any]]:
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
 
+    # 时间格式匹配: "Mon, Jan 26 · 5:30 PM EST" 或 "Every two weeks on Tue·Jan 27 · 6:30 PM"
+    time_pattern = re.compile(
+        r'((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*[,\s·]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s*·?\s*\d+:\d+\s*[AP]M(?:\s*[A-Z]{2,4})?)',
+        re.IGNORECASE
+    )
+
     for url in urls:
         try:
             response = requests.get(url, headers=headers, timeout=30)
@@ -342,12 +354,26 @@ def get_meetup_events() -> List[Dict[str, Any]]:
 
             for link in event_links[:15]:
                 href = link.get('href', '')
-                name = link.get_text(strip=True)
+                full_text = link.get_text(strip=True)
 
-                if name and href:
+                if full_text and href:
+                    # 尝试从文本中提取时间
+                    time_match = time_pattern.search(full_text)
+                    start_time = ""
+                    name = full_text
+
+                    if time_match:
+                        start_time = time_match.group(1).strip()
+                        # 从名称中移除时间部分，保留前面的标题
+                        name_parts = full_text.split(time_match.group(1))
+                        if name_parts[0].strip():
+                            name = name_parts[0].strip()
+                            # 清理末尾的特殊字符
+                            name = re.sub(r'[\s·,]+$', '', name)
+
                     events.append({
                         "name": name,
-                        "start": "",
+                        "start": start_time,
                         "url": href,
                         "location": "New York",
                         "source": "Meetup"
