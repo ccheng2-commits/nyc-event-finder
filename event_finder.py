@@ -26,7 +26,7 @@ load_dotenv()
 # 搜索配置
 LOCATION = "New York"
 SEARCH_KEYWORDS = ["tech", "startup", "design", "networking", "AI", "creative"]
-DAYS_AHEAD = 14
+DAYS_AHEAD = 21
 
 # 日历冲突检测配置
 CALENDAR_NAMES = ["ccheng2@sva.edu", "ixD Events", "ixD- class of 2027"]
@@ -186,13 +186,13 @@ def filter_conflicting_events(events: List[Dict[str, Any]], calendar_events: Lis
 
 
 def get_luma_events() -> List[Dict[str, Any]]:
-    """从 Luma 获取纽约的活动"""
+    """从 Luma 获取纽约的活动（使用 __NEXT_DATA__ JSON）"""
     events = []
 
-    # Luma NYC discover page
+    # Luma 域名已从 lu.ma 改为 luma.com
     urls = [
-        "https://lu.ma/nyc",
-        "https://lu.ma/discover?city=New%20York",
+        "https://luma.com/nyc",
+        "https://luma.com/discover?city=New%20York",
     ]
 
     headers = {
@@ -201,48 +201,40 @@ def get_luma_events() -> List[Dict[str, Any]]:
 
     for url in urls:
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
             if response.status_code != 200:
                 continue
 
-            # 尝试从页面提取 JSON 数据
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # 查找 script 标签中的事件数据
-            scripts = soup.find_all('script')
-            for script in scripts:
-                if script.string and 'events' in script.string.lower():
-                    # 尝试提取 JSON
-                    try:
-                        # 查找 JSON 对象
-                        matches = re.findall(r'\{[^{}]*"name"[^{}]*"start_at"[^{}]*\}', script.string)
-                        for match in matches:
-                            try:
-                                event_data = json.loads(match)
-                                events.append({
-                                    "name": event_data.get("name", ""),
-                                    "start": event_data.get("start_at", ""),
-                                    "url": event_data.get("url", ""),
-                                    "location": event_data.get("geo_address_info", {}).get("full_address", "New York"),
-                                    "source": "Luma"
-                                })
-                            except json.JSONDecodeError:
-                                continue
-                    except Exception:
-                        continue
+            # 从 Next.js __NEXT_DATA__ 提取事件数据
+            next_data = soup.find('script', id='__NEXT_DATA__')
+            if next_data and next_data.string:
+                try:
+                    data = json.loads(next_data.string)
+                    initial_data = data.get('props', {}).get('pageProps', {}).get('initialData', {}).get('data', {})
 
-            # 备用方案: 从 HTML 提取活动链接
-            event_links = soup.find_all('a', href=re.compile(r'lu\.ma/[a-zA-Z0-9]+'))
-            for link in event_links[:20]:  # 限制数量
-                href = link.get('href', '')
-                if href and 'lu.ma' in href:
-                    events.append({
-                        "name": link.get_text(strip=True) or "Luma Event",
-                        "start": "",
-                        "url": href if href.startswith('http') else f"https://lu.ma{href}",
-                        "location": "New York",
-                        "source": "Luma"
-                    })
+                    # 合并 events 和 featured_events
+                    all_events = initial_data.get('events', []) + initial_data.get('featured_events', [])
+
+                    for item in all_events:
+                        event_obj = item.get('event', {})
+                        event_name = event_obj.get('name', '')
+                        event_url = event_obj.get('url', '')
+                        start_at = item.get('start_at') or event_obj.get('start_at', '')
+                        geo_info = event_obj.get('geo_address_info', {})
+                        location = geo_info.get('full_address') or geo_info.get('city', 'New York')
+
+                        if event_name and event_url:
+                            events.append({
+                                "name": event_name,
+                                "start": start_at,
+                                "url": f"https://luma.com/{event_url}",
+                                "location": location,
+                                "source": "Luma"
+                            })
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    print(f"  Error parsing Luma JSON: {e}")
 
         except Exception as e:
             print(f"Error fetching Luma events from {url}: {e}")
@@ -251,17 +243,19 @@ def get_luma_events() -> List[Dict[str, Any]]:
 
 
 def get_eventbrite_events() -> List[Dict[str, Any]]:
-    """从 Eventbrite 公开页面获取活动"""
+    """从 Eventbrite 获取活动（使用 JSON-LD 结构化数据）"""
     events = []
+    seen_urls = set()
 
-    # Eventbrite NYC 公开搜索页面
+    # Eventbrite NYC 搜索页面
     base_url = "https://www.eventbrite.com/d/ny--new-york"
 
     search_urls = [
         f"{base_url}/tech/",
         f"{base_url}/startup/",
         f"{base_url}/networking/",
-        f"{base_url}/business/",
+        f"{base_url}/ai/",
+        f"{base_url}/design/",
     ]
 
     headers = {
@@ -277,42 +271,39 @@ def get_eventbrite_events() -> List[Dict[str, Any]]:
 
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # 查找活动卡片
-            event_cards = soup.find_all('div', {'data-testid': re.compile(r'event-card')})
-            if not event_cards:
-                event_cards = soup.find_all('article')
-            if not event_cards:
-                event_cards = soup.find_all('div', class_=re.compile(r'event'))
-
-            for card in event_cards[:15]:
+            # 从 JSON-LD (ItemList) 提取事件数据
+            json_ld_scripts = soup.find_all('script', type='application/ld+json')
+            for script in json_ld_scripts:
                 try:
-                    # 提取活动名称
-                    title_elem = card.find(['h2', 'h3', 'a'])
-                    name = title_elem.get_text(strip=True) if title_elem else ""
+                    data = json.loads(script.string)
+                    if isinstance(data, dict) and data.get('@type') == 'ItemList':
+                        items = data.get('itemListElement', [])
+                        for item in items:
+                            event_data = item.get('item', {})
+                            event_url = event_data.get('url', '')
 
-                    # 提取链接
-                    link = card.find('a', href=True)
-                    event_url = link['href'] if link else ""
-                    if event_url and not event_url.startswith('http'):
-                        event_url = f"https://www.eventbrite.com{event_url}"
+                            # 去重
+                            if event_url in seen_urls:
+                                continue
+                            seen_urls.add(event_url)
 
-                    # 提取日期
-                    date_elem = card.find(['time', 'span'], class_=re.compile(r'date|time'))
-                    date_str = date_elem.get_text(strip=True) if date_elem else ""
+                            event_name = event_data.get('name', '')
+                            start_date = event_data.get('startDate', '')
+                            location = event_data.get('location', {})
+                            if isinstance(location, dict):
+                                location = location.get('name', '') or location.get('address', {}).get('addressLocality', 'New York')
+                            else:
+                                location = 'New York'
 
-                    # 提取地点
-                    location_elem = card.find(['span', 'p'], class_=re.compile(r'location|venue'))
-                    location = location_elem.get_text(strip=True) if location_elem else "New York"
-
-                    if name and event_url:
-                        events.append({
-                            "name": name,
-                            "start": date_str,
-                            "url": event_url,
-                            "location": location,
-                            "source": "Eventbrite"
-                        })
-                except Exception:
+                            if event_name and event_url:
+                                events.append({
+                                    "name": event_name,
+                                    "start": start_date,
+                                    "url": event_url,
+                                    "location": location,
+                                    "source": "Eventbrite"
+                                })
+                except (json.JSONDecodeError, KeyError, TypeError):
                     continue
 
         except Exception as e:
@@ -385,6 +376,73 @@ def get_meetup_events() -> List[Dict[str, Any]]:
     return events
 
 
+def get_garysguide_events() -> List[Dict[str, Any]]:
+    """从 GarysGuide 获取 NYC Tech 活动"""
+    events = []
+    seen_urls = set()
+
+    url = "https://www.garysguide.com/events?region=nyc"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code != 200:
+            return events
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # 查找所有事件链接
+        event_links = soup.find_all('a', href=lambda x: x and '/events/' in x and x.count('/') >= 2)
+
+        for link in event_links:
+            href = link.get('href', '')
+
+            # 过滤非事件链接
+            if not href or 'region=' in href or href in seen_urls:
+                continue
+
+            event_name = link.get_text(strip=True)
+            if not event_name or len(event_name) < 5 or 'Newsletter' in event_name:
+                continue
+
+            seen_urls.add(href)
+
+            # 构建完整 URL
+            full_url = f"https://www.garysguide.com{href}" if href.startswith('/') else href
+
+            # 尝试从父元素提取日期和地点
+            parent_row = link.find_parent('tr')
+            date_str = ""
+            location = "New York"
+
+            if parent_row:
+                text = parent_row.get_text(' ', strip=True)
+                # 提取日期模式 "Jan 23" 等
+                date_match = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}', text)
+                if date_match:
+                    date_str = date_match.group(0)
+                # 提取时间
+                time_match = re.search(r'\d{1,2}:\d{2}\s*(am|pm)', text, re.IGNORECASE)
+                if time_match:
+                    date_str += f" {time_match.group(0)}"
+
+            events.append({
+                "name": event_name,
+                "start": date_str,
+                "url": full_url,
+                "location": location,
+                "source": "GarysGuide"
+            })
+
+    except Exception as e:
+        print(f"Error fetching GarysGuide events: {e}")
+
+    return events
+
+
 def format_event(event: Dict[str, Any]) -> str:
     """格式化单个活动信息"""
     name = event.get("name", "未知活动")
@@ -419,8 +477,12 @@ def collect_all_events() -> List[Dict[str, Any]]:
     meetup_events = get_meetup_events()
     print(f"  Found {len(meetup_events)} Meetup events")
 
+    print("Fetching from GarysGuide...")
+    garysguide_events = get_garysguide_events()
+    print(f"  Found {len(garysguide_events)} GarysGuide events")
+
     # 合并去重
-    for event in luma_events + eb_events + meetup_events:
+    for event in luma_events + eb_events + meetup_events + garysguide_events:
         url = event.get("url", "")
         if url and url not in seen_urls:
             seen_urls.add(url)
