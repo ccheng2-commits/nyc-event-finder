@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil.rrule import rrulestr
 from dotenv import load_dotenv
 
@@ -250,50 +251,58 @@ def get_luma_events() -> List[Dict[str, Any]]:
     return events
 
 
+def _fetch_eventbrite_url(url: str) -> List[Dict[str, Any]]:
+    results = []
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code != 200:
+            return results
+        soup = BeautifulSoup(response.text, "html.parser")
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string)
+                if not (isinstance(data, dict) and data.get("@type") == "ItemList"):
+                    continue
+                for item in data.get("itemListElement", []):
+                    ed = item.get("item", {})
+                    event_url = ed.get("url", "")
+                    if not event_url:
+                        continue
+                    event_name = ed.get("name", "")
+                    start_date = ed.get("startDate", "")
+                    location = ed.get("location", {})
+                    if isinstance(location, dict):
+                        location = location.get("name", "") or location.get("address", {}).get("addressLocality", "New York")
+                    else:
+                        location = "New York"
+                    if event_name:
+                        results.append({
+                            "name": event_name,
+                            "start": start_date,
+                            "url": event_url,
+                            "location": location,
+                            "source": "Eventbrite",
+                        })
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Error fetching Eventbrite events from {url}: {e}")
+    return results
+
+
 def get_eventbrite_events() -> List[Dict[str, Any]]:
     events, seen = [], set()
     base_url = "https://www.eventbrite.com/d/ny--new-york"
     search_urls = [f"{base_url}/tech/", f"{base_url}/startup/", f"{base_url}/networking/", f"{base_url}/ai/", f"{base_url}/design/", f"{base_url}/history/", f"{base_url}/museum/", f"{base_url}/culture/", f"{base_url}/dogs/", f"{base_url}/pets/"]
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 
-    for url in search_urls:
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code != 200:
-                continue
-            soup = BeautifulSoup(response.text, "html.parser")
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string)
-                    if not (isinstance(data, dict) and data.get("@type") == "ItemList"):
-                        continue
-                    for item in data.get("itemListElement", []):
-                        ed = item.get("item", {})
-                        event_url = ed.get("url", "")
-                        if not event_url or event_url in seen:
-                            continue
-                        seen.add(event_url)
-
-                        event_name = ed.get("name", "")
-                        start_date = ed.get("startDate", "")
-                        location = ed.get("location", {})
-                        if isinstance(location, dict):
-                            location = location.get("name", "") or location.get("address", {}).get("addressLocality", "New York")
-                        else:
-                            location = "New York"
-
-                        if event_name:
-                            events.append({
-                                "name": event_name,
-                                "start": start_date,
-                                "url": event_url,
-                                "location": location,
-                                "source": "Eventbrite",
-                            })
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"Error fetching Eventbrite events from {url}: {e}")
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for batch in pool.map(_fetch_eventbrite_url, search_urls):
+            for event in batch:
+                url = event.get("url", "")
+                if url and url not in seen:
+                    seen.add(url)
+                    events.append(event)
 
     return events
 
@@ -409,27 +418,33 @@ def format_event(event: Dict[str, Any]) -> str:
 def collect_all_events() -> List[Dict[str, Any]]:
     all_events, seen_urls = [], set()
 
-    print("Fetching from Luma...")
-    luma_events = get_luma_events()
-    print(f"  Found {len(luma_events)} Luma events")
+    sources = {
+        "Luma": get_luma_events,
+        "Eventbrite": get_eventbrite_events,
+        "Meetup": get_meetup_events,
+        "GarysGuide": get_garysguide_events,
+    }
 
-    print("Fetching from Eventbrite...")
-    eb_events = get_eventbrite_events()
-    print(f"  Found {len(eb_events)} Eventbrite events")
+    print(f"Fetching from {len(sources)} sources in parallel...")
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(fn): name for name, fn in sources.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                events = future.result()
+                results[name] = events
+                print(f"  {name}: {len(events)} events")
+            except Exception as e:
+                print(f"  {name}: error - {e}")
+                results[name] = []
 
-    print("Fetching from Meetup...")
-    meetup_events = get_meetup_events()
-    print(f"  Found {len(meetup_events)} Meetup events")
-
-    print("Fetching from GarysGuide...")
-    garysguide_events = get_garysguide_events()
-    print(f"  Found {len(garysguide_events)} GarysGuide events")
-
-    for event in luma_events + eb_events + meetup_events + garysguide_events:
-        url = event.get("url", "")
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            all_events.append(event)
+    for name in sources:
+        for event in results.get(name, []):
+            url = event.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_events.append(event)
 
     return all_events
 
